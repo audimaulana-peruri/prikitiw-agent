@@ -5,7 +5,7 @@ import { stdin as input, stdout as output } from "node:process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
@@ -81,6 +81,42 @@ const workspace = process.cwd();
 
 const MAX_FILE_SIZE = 50000;
 const MAX_ITERATIONS = 30;
+
+// ============================================================
+// COMMAND EXECUTION CONFIG
+// ============================================================
+
+// Hard safety limit for a command that never returns.
+const COMMAND_TIMEOUT_MS = 120000;
+
+// If a command produces no stdout/stderr for this long, treat it as
+// stuck. This prevents the agent from waiting forever on a dead process.
+const COMMAND_IDLE_TIMEOUT_MS = 30000;
+
+// Long-running development servers such as `npm run dev` are expected.
+// Once a readiness signal appears, the tool returns control to the agent
+// while keeping the process alive.
+const LONG_RUNNING_COMMANDS = [
+  /^npm(?:\.cmd)?\s+run\s+(dev|start)\b/i,
+  /^pnpm(?:\.cmd)?\s+(dev|start)\b/i,
+  /^yarn(?:\.cmd)?\s+(dev|start)\b/i,
+  /^bun(?:\.exe)?\s+(dev|start)\b/i,
+];
+
+const PROCESS_READY_PATTERNS = [
+  /ready/i,
+  /ready in/i,
+  /listening on/i,
+  /localhost:\d+/i,
+  /http:\/\//i,
+  /https:\/\//i,
+  /compiled successfully/i,
+  /server started/i,
+  /started server/i,
+  /running at/i,
+];
+
+const activeProcesses = new Set();
 
 // ============================================================
 // AUTHENTICATION
@@ -519,76 +555,398 @@ async function main() {
   // TOOL: RUN COMMAND
   // ============================================================
 
-  async function runCommand(args) {
-    console.log("");
+  // ============================================================
+  // COMMAND PERMISSION POLICY
+  // ============================================================
 
-    console.log(
-      "┌─ COMMAND ─────────────────────────────"
-    );
+  function normalizeCommand(command) {
+    return String(command || "")
+      .trim()
+      .replace(/\s+/g, " ");
+  }
 
-    console.log(`│ ${args.command}`);
+  function commandRequiresConfirmation(command) {
+    const cmd = normalizeCommand(command).toLowerCase();
 
-    console.log(
-      "└───────────────────────────────────────"
-    );
+    // Empty commands are never executed.
+    if (!cmd) return true;
 
-    const answer =
-      await rl.question(
-        "Run this command? [y/N] "
-      );
+    // Explicitly dangerous/system-level operations.
+    const dangerousPatterns = [
+      /\bformat(?:\.com)?\b/,
+      /\bshutdown(?:\.exe)?\b/,
+      /\brestart-computer\b/,
+      /\bstop-computer\b/,
+      /\bremove-computer\b/,
+      /\breg(?:\.exe)?\s+(add|delete|import|load|unload)\b/,
+      /\bsc(?:\.exe)?\s+(create|delete|config|stop|start)\b/,
+      /\bnet\s+(user|localgroup|start|stop)\b/,
+      /\btaskkill(?:\.exe)?\b/,
+      /\bdel(?:\.exe)?\s+(?:\/s|\/f|\/q)\b/,
+      /\berase(?:\.exe)?\b/,
+      /\brmdir(?:\.exe)?\s+(?:\/s|\/q)\b/,
+      /\brm\s+-rf\b/,
+      /\bmkfs\b/,
+      /\bdd\s+if=/,
+      /\bsudo\b/,
+      /\bsu\s+-?\s*(root)?\b/,
+      /\bchmod\s+[0-7]*7[0-7]*\b/,
+      /\bchown\b/,
+      /\bkill(?:all)?\b/,
+      /\bpkill\b/,
+      /\bpoweroff\b/,
+      /\breboot\b/,
+      /\b(?:git\s+reset\s+--hard|git\s+clean\s+-[^\n]*f|git\s+checkout\s+--)\b/,
+      /\b(?:git\s+push\s+--force|git\s+push\s+-f)\b/,
+    ];
 
-    if (
-      answer.toLowerCase() !== "y"
-    ) {
-      return "Command execution cancelled by user.";
+    if (dangerousPatterns.some((pattern) => pattern.test(cmd))) {
+      return true;
     }
+
+    // PowerShell is powerful enough that arbitrary scripts should not be
+    // silently approved. Allow simple read/development commands below.
+    if (/\bpowershell(?:\.exe)?\b/.test(cmd) || /\bpwsh(?:\.exe)?\b/.test(cmd)) {
+      const safePowerShell = [
+        /\bget-childitem\b/,
+        /\bget-content\b/,
+        /\bselect-string\b/,
+        /\btest-path\b/,
+        /\bresolve-path\b/,
+        /\bget-location\b/,
+        /\bget-item\b/,
+        /\bwhere-object\b/,
+        /\bforeach-object\b/,
+      ];
+
+      const hasExecutionOrMutation = [
+        /\binvoke-expression\b/,
+        /\binvoke-webrequest\b/,
+        /\binvoke-restmethod\b/,
+        /\bstart-process\b/,
+        /\bremove-item\b/,
+        /\bset-content\b/,
+        /\badd-content\b/,
+        /\bcopy-item\b/,
+        /\bmove-item\b/,
+        /\bnew-item\b/,
+        /\bset-item\b/,
+        /\bdownloadstring\b/,
+        /\bencodedcommand\b/,
+        /\bcommand\s+.*base64\b/,
+      ].some((pattern) => pattern.test(cmd));
+
+      if (hasExecutionOrMutation) return true;
+      if (!safePowerShell.some((pattern) => pattern.test(cmd))) return true;
+    }
+
+    // Shell chaining can hide a dangerous second command. If the command
+    // contains chaining/redirection, inspect each segment separately.
+    const chained = cmd
+      .split(/&&|\|\||[;&]/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+
+    if (chained.length > 1) {
+      const hasDangerousSegment = chained.some((part) =>
+        dangerousPatterns.some((pattern) => pattern.test(part))
+      );
+      if (hasDangerousSegment) return true;
+    }
+
+    // Commands commonly used by coding agents and normally safe within the
+    // project/workspace.
+    const safePrefixes = [
+      "node ",
+      "node.exe ",
+      "npm ",
+      "npm.exe ",
+      "npx ",
+      "npx.cmd ",
+      "pnpm ",
+      "pnpm.cmd ",
+      "yarn ",
+      "yarn.cmd ",
+      "bun ",
+      "bun.exe ",
+      "deno ",
+      "python ",
+      "python.exe ",
+      "py ",
+      "pytest",
+      "vitest",
+      "jest",
+      "mocha",
+      "playwright",
+      "tsc",
+      "eslint",
+      "prettier",
+      "mvn ",
+      "mvnw ",
+      "gradle ",
+      "gradlew ",
+      "dotnet ",
+      "cargo ",
+      "go ",
+      "git status",
+      "git diff",
+      "git log",
+      "git show",
+      "git branch",
+      "git remote -v",
+      "git rev-parse",
+      "git ls-files",
+      "git grep",
+      "git check-ignore",
+      "dir",
+      "type ",
+      "where ",
+      "where.exe ",
+      "findstr ",
+      "echo ",
+    ];
+
+    if (safePrefixes.some((prefix) => cmd === prefix.trim() || cmd.startsWith(prefix))) {
+      return false;
+    }
+
+    // Plain read-only shell commands are allowed.
+    const readOnlyCommands = [
+      "pwd",
+      "ls",
+      "cat ",
+      "head ",
+      "tail ",
+      "grep ",
+      "find ",
+      "which ",
+      "whoami",
+      "ver",
+      "set",
+      "git status",
+      "git diff",
+      "git log",
+    ];
+
+    if (readOnlyCommands.some((prefix) => cmd === prefix.trim() || cmd.startsWith(prefix))) {
+      return false;
+    }
+
+    // Unknown commands remain confirmation-required.
+    return true;
+  }
+
+  function isLongRunningCommand(command) {
+    return LONG_RUNNING_COMMANDS.some((pattern) => pattern.test(command));
+  }
+
+  function hasProcessReadySignal(output) {
+    return PROCESS_READY_PATTERNS.some((pattern) => pattern.test(output));
+  }
+
+  function killProcessTree(child) {
+    if (!child || child.killed) return;
 
     try {
-      const {
-        stdout,
-        stderr,
-      } = await execAsync(
-        args.command,
-        {
-          cwd: workspace,
+      if (process.platform === "win32") {
+        // Kill the complete process tree on Windows.
+        exec(`taskkill /pid ${child.pid} /T /F`, () => {});
+      } else {
+        process.kill(-child.pid, "SIGTERM");
+      }
+    } catch {}
+  }
 
-          windowsHide: false,
+  function runCommandWithMonitoring(command) {
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      const longRunning = isLongRunningCommand(command);
 
-          maxBuffer:
-            10 * 1024 * 1024,
-        }
+      console.log(`🚀 Starting: ${command}`);
+      console.log(`   📂 cwd: ${workspace}`);
+      console.log(
+        `   ⏱️ timeout: ${Math.round(COMMAND_TIMEOUT_MS / 1000)}s | idle: ${Math.round(COMMAND_IDLE_TIMEOUT_MS / 1000)}s`
       );
 
-      return [
-        stdout
-          ? `STDOUT:\n${stdout}`
-          : "",
+      const child = spawn(command, {
+        cwd: workspace,
+        shell: true,
+        windowsHide: false,
+        detached: process.platform !== "win32",
+      });
 
-        stderr
-          ? `STDERR:\n${stderr}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
-    } catch (error) {
-      return [
-        "Command failed.",
+      activeProcesses.add(child);
 
-        `Exit code: ${
-          error.code ?? "unknown"
-        }`,
+      let stdout = "";
+      let stderr = "";
+      let lastActivity = Date.now();
+      let finished = false;
+      let readyDetected = false;
 
-        error.stdout
-          ? `STDOUT:\n${error.stdout}`
-          : "",
+      const finish = (result) => {
+        if (finished) return;
+        finished = true;
 
-        error.stderr
-          ? `STDERR:\n${error.stderr}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
+        clearInterval(watchdog);
+        activeProcesses.delete(child);
+
+        resolve(result);
+      };
+
+      const printOutput = (label, chunk) => {
+        const value = String(chunk);
+        if (!value) return;
+
+        lastActivity = Date.now();
+
+        // Capture the process response, but do not print every chunk live.
+        // This avoids flooding the terminal when a command prints source code,
+        // bundles, stack traces, or large generated output.
+        if (label === "STDOUT") {
+          stdout += value;
+          if (stdout.length > 200000) stdout = stdout.slice(-200000);
+        } else {
+          stderr += value;
+          if (stderr.length > 200000) stderr = stderr.slice(-200000);
+        }
+
+        if (longRunning && hasProcessReadySignal(value)) {
+          readyDetected = true;
+          console.log("   ✅ Process ready. Returning control to agent...");
+          console.log("   💡 Long-running process remains active.");
+
+          finish([
+            "Command started successfully and is still running.",
+            "The process was kept alive because this is a long-running development command.",
+            "Readiness signal detected.",
+            stdout ? `STDOUT:\n${stdout}` : "",
+            stderr ? `STDERR:\n${stderr}` : "",
+          ].filter(Boolean).join("\n"));
+        }
+      };
+
+      child.stdout?.on("data", (chunk) => printOutput("STDOUT", chunk));
+      child.stderr?.on("data", (chunk) => printOutput("STDERR", chunk));
+
+      child.on("error", (error) => {
+        finish([
+          "Command failed to start.",
+          `Error: ${error.message}`,
+          stdout ? `STDOUT:\n${stdout}` : "",
+          stderr ? `STDERR:\n${stderr}` : "",
+        ].filter(Boolean).join("\n"));
+      });
+
+      child.on("close", (code, signal) => {
+        if (finished) return;
+
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        console.log(`   🏁 Process exited | code=${code ?? "unknown"} | signal=${signal ?? "none"} | ${elapsed}s`);
+
+        finish([
+          code === 0
+            ? "Command completed successfully."
+            : `Command failed with exit code ${code ?? "unknown"}.`,
+          signal ? `Signal: ${signal}` : "",
+          stdout ? `STDOUT:\n${stdout}` : "",
+          stderr ? `STDERR:\n${stderr}` : "",
+        ].filter(Boolean).join("\n"));
+      });
+
+      const watchdog = setInterval(() => {
+        if (finished) return;
+
+        const now = Date.now();
+        const totalElapsed = now - startedAt;
+        const idleElapsed = now - lastActivity;
+
+        if (totalElapsed >= COMMAND_TIMEOUT_MS) {
+          console.log("");
+          console.log("   🛑 STOP PROCESSING: hard timeout reached.");
+          console.log(`   Command exceeded ${Math.round(COMMAND_TIMEOUT_MS / 1000)} seconds.`);
+          killProcessTree(child);
+
+          finish([
+            "Command execution stopped because the hard timeout was reached.",
+            `Timeout: ${Math.round(COMMAND_TIMEOUT_MS / 1000)} seconds.`,
+            stdout ? `STDOUT:\n${stdout}` : "",
+            stderr ? `STDERR:\n${stderr}` : "",
+          ].filter(Boolean).join("\n"));
+          return;
+        }
+
+        // Do not use the idle timeout for a long-running server before it
+        // emits its readiness signal; the hard timeout still protects us.
+        if (!longRunning && idleElapsed >= COMMAND_IDLE_TIMEOUT_MS) {
+          console.log("");
+          console.log("   🛑 STOP PROCESSING: no response/output detected.");
+          console.log(`   No stdout/stderr for ${Math.round(COMMAND_IDLE_TIMEOUT_MS / 1000)} seconds.`);
+          killProcessTree(child);
+
+          finish([
+            "Command execution stopped because no output/response was received.",
+            `Idle timeout: ${Math.round(COMMAND_IDLE_TIMEOUT_MS / 1000)} seconds.`,
+            stdout ? `STDOUT:\n${stdout}` : "",
+            stderr ? `STDERR:\n${stderr}` : "",
+          ].filter(Boolean).join("\n"));
+        }
+      }, 1000);
+    });
+  }
+
+  function formatCommandResponse(result) {
+    const maxResponse = 12000;
+    if (!result) return "Command completed with no output.";
+
+    if (result.length <= maxResponse) return result;
+
+    return (
+      result.slice(0, maxResponse) +
+      `\\n\\n[Output truncated to ${maxResponse} characters.]`
+    );
+  }
+
+  async function runCommand(args) {
+    const command = normalizeCommand(args.command);
+
+    if (!command) {
+      return "Command execution skipped: empty command.";
     }
+
+    const needsConfirmation = commandRequiresConfirmation(command);
+
+    console.log("");
+    console.log("┌─ COMMAND ─────────────────────────────");
+    console.log(`│ ${command}`);
+    console.log(`│ ${needsConfirmation ? "🔐 Confirmation required" : "⚡ Auto-approved"}`);
+    console.log("└───────────────────────────────────────");
+
+    if (needsConfirmation) {
+      const answer = await rl.question(
+        "This command can affect the system or is outside the safe development policy. Run it? [y/N] "
+      );
+
+      if (answer.toLowerCase() !== "y") {
+        return "Command execution cancelled by user.";
+      }
+    }
+
+    const result = await runCommandWithMonitoring(command);
+
+    console.log("");
+    console.log("┌─ RESPONSE ────────────────────────────");
+    console.log(formatCommandResponse(result));
+    console.log("└───────────────────────────────────────");
+
+    return formatCommandResponse(result);
+  }
+
+  // Clean up child processes when PRIKITIW itself exits.
+  function cleanupActiveProcesses() {
+    for (const child of activeProcesses) {
+      killProcessTree(child);
+    }
+    activeProcesses.clear();
   }
 
   // ============================================================
@@ -720,6 +1078,9 @@ async function main() {
   - Never access files outside the workspace.
   - Avoid destructive operations.
   - Do not expose internal reasoning.
+  - Do not ask the user for permission before using a tool. Tool execution is governed by the local safety policy.
+  - Prefer autonomous execution for normal development work such as inspecting files, editing project files, running tests, builds, linters, package scripts, and read-only Git commands.
+  - If a requested command is blocked or requires confirmation, explain why briefly and continue with a safe alternative when possible.
   - Work iteratively.
   - Verify your changes whenever possible.
 
@@ -1082,11 +1443,19 @@ async function main() {
     }
   }
 
+  cleanupActiveProcesses();
   rl.close();
 
   console.log("🎤 PRIKITIW pamit. Sampai ketemu lagi, bosku! 👋😂");
 
 }
+
+process.on("SIGINT", () => {
+  console.log("");
+  console.log("🛑 PRIKITIW menerima Ctrl+C. Menghentikan proses aktif...");
+  cleanupActiveProcesses();
+  process.exit(130);
+});
 
 main().catch((error) => {
   if (error?.code === "ABORT_ERR") {
