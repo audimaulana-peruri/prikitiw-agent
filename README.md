@@ -1,4 +1,4 @@
-# 🎤 PRIKITIW AI
+# 🎤 PRIKITIW AGENT
 
 PRIKITIW is a lightweight autonomous coding-agent CLI inspired by tools such as Codex.
 
