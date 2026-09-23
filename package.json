@@ -1,0 +1,24 @@
+{
+  "name": "prikitiw-agent",
+  "version": "0.1.0",
+  "description": "PRIKITIW - autonomous coding agent CLI powered by the INAdigital AI gateway",
+  "type": "module",
+  "bin": {
+    "prikitiw": "./agent.mjs"
+  },
+  "files": [
+    "agent.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node ./agent.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "openai": "^5.12.2"
+  },
+  "license": "MIT"
+}

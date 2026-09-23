@@ -1,0 +1,15 @@
+{
+  "name": "prikitiw-agent",
+  "version": "0.1.0",
+  "description": "PRIKITIW AI Coding Agent",
+  "type": "module",
+  "bin": {
+    "prikitiw": "./agent.mjs"
+  },
+  "scripts": {
+    "start": "node agent.mjs"
+  },
+  "dependencies": {
+    "openai": "^5.0.0"
+  }
+}
